@@ -1,166 +1,139 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "httpx",
+#   "pandas",
+#   "seaborn",
+#   "matplotlib",
+#   "numpy",
+#   "scikit-learn",
+#   "chardet"
+# ] 
+# ///
+
 import os
+import sys
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-import requests
-import logging
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+import numpy as np
+from sklearn.cluster import KMeans
+import httpx
+import time
+import chardet
 
-# Load environment variables from .env file
-load_dotenv()
-API_TOKEN = os.getenv("AIPROXY_TOKEN")
-if not API_TOKEN:
-    raise RuntimeError("Environment variable AIPROXY_TOKEN is not set. Please check your .env file.")
+API_URL = "https://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
+AIPROXY_TOKEN = os.getenv("AIPROXY_TOKEN")
 
-API_BASE = "https://aiproxy.sanand.workers.dev/openai/v1"
+if not AIPROXY_TOKEN:
+    print("Error: AIPROXY_TOKEN environment variable is not set.")
+    sys.exit(1)
 
-# Set up logging
-logging.basicConfig(
-    filename="autolysis.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-app = FastAPI()
-
-# Create output directory
-def create_output_directory(dataset_name):
-    directory = dataset_name.split('.')[0]
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-    return directory
-
-# Load dataset
-def load_dataset(file_path):
+def load_data(file_path):
     try:
-        data = pd.read_csv(file_path, encoding="latin1")
-        logging.info("Dataset loaded successfully.")
+        with open(file_path, 'rb') as f:
+            result = chardet.detect(f.read())  # Detect the encoding
+        encoding = result['encoding']
+        data = pd.read_csv(file_path, encoding=encoding)  # Use detected encoding
         return data
     except Exception as e:
-        logging.error(f"Error loading dataset: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to load dataset: {e}")
+        print(f"Error loading file {file_path}: {e}")
+        sys.exit(1)
 
-# Preprocess data
-def preprocess_data(data):
-    try:
-        data = data.apply(pd.to_numeric, errors="coerce")  # Convert all applicable columns to numeric
-        data.fillna(data.mean(numeric_only=True), inplace=True)  # Fill numeric NaNs with mean
-        data.fillna("Unknown", inplace=True)  # Fill non-numeric NaNs with "Unknown"
-        logging.info("Data preprocessing completed.")
-        return data
-    except Exception as e:
-        logging.error(f"Error during preprocessing: {e}")
-        raise HTTPException(status_code=500, detail=f"Data preprocessing failed: {e}")
+def basic_analysis(data):
+    summary = data.describe(include='all').to_dict()
+    missing_values = data.isnull().sum().to_dict()
+    return {"summary": summary, "missing_values": missing_values}
 
-# Analyze data
-def analyze_data(data):
-    try:
-        numeric_cols = data.select_dtypes(include=["number"])
-        categorical_cols = data.select_dtypes(exclude=["number"])
+def outlier_detection(data):
+    numeric_data = data.select_dtypes(include=np.number)
+    z_scores = np.abs((numeric_data - numeric_data.mean()) / numeric_data.std())
+    outliers = (z_scores > 3).sum().to_dict()
+    return {"outliers": outliers}
 
-        summary = numeric_cols.describe().to_string()
-        missing = data.isnull().sum()
-        correlation = numeric_cols.corr()
+def cluster_analysis(data):
+    numeric_data = data.select_dtypes(include=np.number).dropna()
+    if numeric_data.shape[1] >= 2:
+        kmeans = KMeans(n_clusters=3, random_state=42)
+        numeric_data['cluster'] = kmeans.fit_predict(numeric_data)
+        sns.scatterplot(
+            x=numeric_data.iloc[:, 0],
+            y=numeric_data.iloc[:, 1],
+            hue=numeric_data['cluster'],
+            palette='viridis'
+        )
+        plt.title("Cluster Analysis")
+        plt.savefig("clusters.png")
+        plt.close()
 
-        categorical_summary = categorical_cols.describe(include="all").to_string() if not categorical_cols.empty else "No categorical data."
+def correlation_matrix(data):
+    correlation = data.corr(numeric_only=True)
+    sns.heatmap(correlation, annot=True, cmap='coolwarm')
+    plt.title("Correlation Matrix")
+    plt.savefig("correlation_matrix.png")
+    plt.close()
 
-        logging.info("Data analysis completed.")
-        return {
-            "summary": summary,
-            "missing": missing,
-            "correlation": correlation,
-            "categorical_summary": categorical_summary,
-        }
-    except Exception as e:
-        logging.error(f"Error during analysis: {e}")
-        raise HTTPException(status_code=500, detail=f"Data analysis failed: {e}")
+def query_llm(prompt):
+    headers = {"Authorization": f"Bearer {AIPROXY_TOKEN}"}
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1000,
+        "temperature": 0.7
+    }
+    retries = 3
+    for attempt in range(retries):
+        try:
+            response = httpx.post(API_URL, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"].strip()
+        except httpx.RequestError as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            time.sleep(2)
+    print("Failed after multiple retries.")
+    sys.exit(1)
 
-# Visualize data
-def visualize_data(data, correlation, output_dir):
-    try:
-        if not correlation.empty:
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(correlation, annot=True, cmap="coolwarm")
-            plt.title("Correlation Heatmap")
-            plt.savefig(os.path.join(output_dir, f"correlation_heatmap.png"))
-            plt.close()
+def generate_story(data, analysis, charts):
+    prompt = (
+        "You are a creative storyteller. "
+        "Craft a compelling narrative based on this dataset analysis:\n\n"
+        f"Data Summary: {analysis['summary']}\n\n"
+        f"Missing Values: {analysis['missing_values']}\n\n"
+        f"Outlier Analysis: {analysis.get('outliers', 'No outliers detected')}\n\n"
+        "The dataset contains information about 10,000 books. "
+        "Create a narrative covering these points:\n"
+        "- Describe the dataset as if introducing it to an audience.\n"
+        "- Highlight interesting insights or anomalies discovered.\n"
+        "- Use a conversational tone, as if explaining findings to a curious reader.\n"
+        "- Reference these charts for visual support: correlation_matrix.png, clusters.png.\n"
+        "End the story with a thought-provoking conclusion about the dataset and its implications."
+    )
+    return query_llm(prompt)
 
-        numeric_cols = data.select_dtypes(include=["number"])
-        for col in numeric_cols.columns:
-            plt.figure()
-            sns.histplot(numeric_cols[col], kde=True)
-            plt.title(f"Histogram of {col}")
-            plt.savefig(os.path.join(output_dir, f"{col}_histogram.png"))
-            plt.close()
+def save_readme(content):
+    with open("README.md", "w") as f:
+        f.write(content)
 
-        logging.info("Visualizations saved as PNG.")
-    except Exception as e:
-        logging.error(f"Error during visualization: {e}")
-        raise HTTPException(status_code=500, detail=f"Visualization failed: {e}")
+def visualize_data(data):
+    correlation_matrix(data)
+    cluster_analysis(data)
 
-# Generate narrative using AI Proxy
-def generate_narrative(data_info):
-    try:
-        prompt = f"""
-        You are a data analyst. Here is the dataset summary:
-        {data_info['summary']}
-        Missing values:
-        {data_info['missing']}
-        Categorical data summary:
-        {data_info['categorical_summary']}
-        Correlation analysis (if applicable):
-        {data_info['correlation']}
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: uv run autolysis.py <dataset.csv>")
+        sys.exit(1)
 
-        Write a detailed analysis story with insights, implications, and recommendations.
-        """
-        headers = {
-            "Authorization": f"Bearer {API_TOKEN}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        response = requests.post(f"{API_BASE}/chat/completions", json=payload, headers=headers)
-        response.raise_for_status()
-        narrative = response.json()["choices"][0]["message"]["content"]
-        logging.info("Narrative generated successfully.")
-        return narrative
-    except Exception as e:
-        logging.error(f"Error generating narrative: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate narrative: {e}")
+    file_path = sys.argv[1]
+    data = load_data(file_path)
 
-# Create README.md
-def create_readme(narrative, output_dir):
-    try:
-        readme_path = os.path.join(output_dir, "README.md")
-        with open(readme_path, "w") as file:
-            file.write("# Analysis Report\n\n")
-            file.write(narrative)
-            file.write("\n\n![Correlation Heatmap](correlation_heatmap.png)\n")
-        logging.info("README.md created successfully.")
-    except Exception as e:
-        logging.error(f"Error creating README.md: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create README.md: {e}")
+    analysis = basic_analysis(data)
+    outliers = outlier_detection(data)
+    combined_analysis = {**analysis, **outliers}
 
-# API endpoint to trigger analysis
-@app.post("/analyze")
-def analyze(dataset_path: str):
-    try:
-        dataset_name = os.path.basename(dataset_path)
-        output_dir = create_output_directory(dataset_name)
+    visualize_data(data)
 
-        data = load_dataset(dataset_path)
-        processed_data = preprocess_data(data)
-        analysis_results = analyze_data(processed_data)
-        visualize_data(processed_data, analysis_results["correlation"], output_dir)
-        narrative = generate_narrative(analysis_results)
-        create_readme(narrative, output_dir)
+    story = generate_story(data, combined_analysis, ["correlation_matrix.png", "clusters.png"])
+    save_readme(story)
 
-        return {"message": f"Analysis completed for {dataset_name}. Output in {output_dir}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the Autolysis API!"}
+if __name__ == "__main__":
+    main()
