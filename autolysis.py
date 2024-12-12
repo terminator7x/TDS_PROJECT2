@@ -1,139 +1,126 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "httpx",
-#   "pandas",
-#   "seaborn",
-#   "matplotlib",
-#   "numpy",
-#   "scikit-learn",
-#   "chardet"
-# ] 
-# ///
-
 import os
 import sys
 import pandas as pd
-import seaborn as sns
 import matplotlib.pyplot as plt
-import numpy as np
-from sklearn.cluster import KMeans
-import httpx
+import seaborn as sns
+import requests
+import json
+import logging
 import time
-import chardet
 
-API_URL = "https://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
-AIPROXY_TOKEN = os.getenv("AIPROXY_TOKEN")
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 
-if not AIPROXY_TOKEN:
-    print("Error: AIPROXY_TOKEN environment variable is not set.")
+# Verify Environment Variable
+if "AIPROXY_TOKEN" not in os.environ:
+    logging.error("AIPROXY_TOKEN environment variable is not set.")
     sys.exit(1)
 
-def load_data(file_path):
+AIPROXY_TOKEN = os.environ["AIPROXY_TOKEN"]
+
+# Function to load dataset
+def load_dataset(file_path: str) -> pd.DataFrame:
     try:
-        with open(file_path, 'rb') as f:
-            result = chardet.detect(f.read())  # Detect the encoding
-        encoding = result['encoding']
-        data = pd.read_csv(file_path, encoding=encoding)  # Use detected encoding
-        return data
+        data = pd.read_csv(file_path, encoding='utf-8')
+    except UnicodeDecodeError:
+        logging.info("UTF-8 decoding failed. Trying ISO-8859-1...")
+        try:
+            data = pd.read_csv(file_path, encoding='ISO-8859-1')
+        except Exception as e:
+            logging.error(f"Error loading dataset: {e}")
+            sys.exit(1)
     except Exception as e:
-        print(f"Error loading file {file_path}: {e}")
+        logging.error(f"Error loading dataset: {e}")
         sys.exit(1)
+    return data
 
-def basic_analysis(data):
-    summary = data.describe(include='all').to_dict()
-    missing_values = data.isnull().sum().to_dict()
-    return {"summary": summary, "missing_values": missing_values}
-
-def outlier_detection(data):
-    numeric_data = data.select_dtypes(include=np.number)
-    z_scores = np.abs((numeric_data - numeric_data.mean()) / numeric_data.std())
-    outliers = (z_scores > 3).sum().to_dict()
-    return {"outliers": outliers}
-
-def cluster_analysis(data):
-    numeric_data = data.select_dtypes(include=np.number).dropna()
-    if numeric_data.shape[1] >= 2:
-        kmeans = KMeans(n_clusters=3, random_state=42)
-        numeric_data['cluster'] = kmeans.fit_predict(numeric_data)
-        sns.scatterplot(
-            x=numeric_data.iloc[:, 0],
-            y=numeric_data.iloc[:, 1],
-            hue=numeric_data['cluster'],
-            palette='viridis'
-        )
-        plt.title("Cluster Analysis")
-        plt.savefig("clusters.png")
-        plt.close()
-
-def correlation_matrix(data):
-    correlation = data.corr(numeric_only=True)
-    sns.heatmap(correlation, annot=True, cmap='coolwarm')
-    plt.title("Correlation Matrix")
-    plt.savefig("correlation_matrix.png")
-    plt.close()
-
-def query_llm(prompt):
-    headers = {"Authorization": f"Bearer {AIPROXY_TOKEN}"}
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1000,
-        "temperature": 0.7
+# Function to analyze the dataset
+def analyze_dataset(df: pd.DataFrame) -> dict:
+    return {
+        "columns": list(df.columns),
+        "data_types": df.dtypes.to_dict(),
+        "missing_values": df.isnull().sum().to_dict(),
+        "summary_stats": df.describe(include="all").to_dict()
     }
-    retries = 3
+
+# Function to visualize data
+def visualize_data(df: pd.DataFrame, output_folder: str) -> list:
+    chart_paths = []
+    numeric_df = df.select_dtypes(include=['number'])
+
+    if not numeric_df.empty:
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(numeric_df.corr(), annot=True, cmap="coolwarm")
+        plt.title("Correlation Heatmap")
+        heatmap_path = os.path.join(output_folder, "heatmap.png")
+        plt.savefig(heatmap_path, dpi=150)
+        plt.close()
+        chart_paths.append(heatmap_path)
+
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(df.isnull(), cbar=False, cmap='viridis')
+    plt.title("Missing Values Heatmap")
+    missing_values_path = os.path.join(output_folder, "missing_values.png")
+    plt.savefig(missing_values_path, dpi=150)
+    plt.close()
+    chart_paths.append(missing_values_path)
+
+    return chart_paths
+
+# Function to send request to AI Proxy (GPT-4o-Mini)
+def generate_narration(prompt: str, retries=3, delay=5) -> str:
+    url = "https://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {AIPROXY_TOKEN}"}
+    data = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}]}
+
     for attempt in range(retries):
         try:
-            response = httpx.post(API_URL, headers=headers, json=payload, timeout=30)
+            response = requests.post(url, headers=headers, data=json.dumps(data))
             response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"].strip()
-        except httpx.RequestError as e:
-            print(f"Attempt {attempt + 1} failed: {e}")
-            time.sleep(2)
-    print("Failed after multiple retries.")
+            return response.json()['choices'][0]['message']['content']
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error generating narration: {e}. Retrying in {delay} seconds...")
+            time.sleep(delay)
+    logging.error("Max retries reached. Exiting.")
     sys.exit(1)
 
-def generate_story(data, analysis, charts):
-    prompt = (
-        "You are a creative storyteller. "
-        "Craft a compelling narrative based on this dataset analysis:\n\n"
-        f"Data Summary: {analysis['summary']}\n\n"
-        f"Missing Values: {analysis['missing_values']}\n\n"
-        f"Outlier Analysis: {analysis.get('outliers', 'No outliers detected')}\n\n"
-        "The dataset contains information about 10,000 books. "
-        "Create a narrative covering these points:\n"
-        "- Describe the dataset as if introducing it to an audience.\n"
-        "- Highlight interesting insights or anomalies discovered.\n"
-        "- Use a conversational tone, as if explaining findings to a curious reader.\n"
-        "- Reference these charts for visual support: correlation_matrix.png, clusters.png.\n"
-        "End the story with a thought-provoking conclusion about the dataset and its implications."
-    )
-    return query_llm(prompt)
+# Create output folder if it does not exist
+def create_output_folder(file_path: str) -> str:
+    folder_name = os.path.splitext(os.path.basename(file_path))[0]  # Get filename without extension
+    output_folder = os.path.join(os.path.dirname(file_path), folder_name)  # Create path for the folder
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    return output_folder
 
-def save_readme(content):
-    with open("README.md", "w") as f:
-        f.write(content)
+# Main function
+def main(file_path: str):
+    output_folder = create_output_folder(file_path)  # Automatically create a folder with the filename
+    df = load_dataset(file_path)
 
-def visualize_data(data):
-    correlation_matrix(data)
-    cluster_analysis(data)
-
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: uv run autolysis.py <dataset.csv>")
+    if df is None or df.empty:
+        logging.error(f"Error: Dataset at {file_path} could not be loaded or is empty.")
         sys.exit(1)
 
-    file_path = sys.argv[1]
-    data = load_data(file_path)
+    summary = analyze_dataset(df)
+    story = generate_narration("Provide a summary of the dataset based on the columns, missing values, and summary statistics.")
+    
+    chart_paths = visualize_data(df, output_folder)
+    
+    readme_path = os.path.join(output_folder, "README.md")
+    with open(readme_path, "w") as f:
+        f.write(f"# Automated Analysis Report\n\n")
+        f.write(f"## Dataset Summary\n\n")
+        f.write(f"### Columns\n{summary['columns']}\n\n")
+        f.write(f"### Data Types\n{summary['data_types']}\n\n")
+        f.write(f"### Missing Values\n{summary['missing_values']}\n\n")
+        f.write(f"### Summary Statistics\n{summary['summary_stats']}\n\n")
+        f.write(f"## Story\n{story}\n\n")
+        f.write("## Visualizations\n")
+        for chart in chart_paths:
+            f.write(f"![Visualization]({chart})\n")
 
-    analysis = basic_analysis(data)
-    outliers = outlier_detection(data)
-    combined_analysis = {**analysis, **outliers}
-
-    visualize_data(data)
-
-    story = generate_story(data, combined_analysis, ["correlation_matrix.png", "clusters.png"])
-    save_readme(story)
+    logging.info(f"Analysis completed. Results saved in {output_folder}/README.md and visualizations.")
 
 if __name__ == "__main__":
-    main()
+    file_path = sys.argv[1]  # Get the file path from the command-line argument
+    main(file_path)
