@@ -1,90 +1,139 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "httpx",
+#   "pandas",
+#   "seaborn",
+#   "matplotlib",
+#   "numpy",
+#   "scikit-learn",
+#   "chardet"
+# ] 
+# ///
+
 import os
 import sys
 import pandas as pd
 import seaborn as sns
-import matplotlib
-matplotlib.use("Agg")  # Use a non-interactive backend
 import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.cluster import KMeans
 import httpx
+import time
 import chardet
 
-# Constants
 API_URL = "https://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
-AIPROXY_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIxZjMwMDAzMjhAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.sdErABQZRIrLR5TaqR1lBDMgCsP2myC7MtqsanZbvQk"
+AIPROXY_TOKEN = os.getenv("AIPROXY_TOKEN")
+
+if not AIPROXY_TOKEN:
+    print("Error: AIPROXY_TOKEN environment variable is not set.")
+    sys.exit(1)
 
 def load_data(file_path):
-    """Load CSV data with encoding detection."""
-    with open(file_path, 'rb') as f:
-        result = chardet.detect(f.read())
-    encoding = result['encoding']
-    return pd.read_csv(file_path, encoding=encoding)
+    try:
+        with open(file_path, 'rb') as f:
+            result = chardet.detect(f.read())  # Detect the encoding
+        encoding = result['encoding']
+        data = pd.read_csv(file_path, encoding=encoding)  # Use detected encoding
+        return data
+    except Exception as e:
+        print(f"Error loading file {file_path}: {e}")
+        sys.exit(1)
 
-def analyze_data(df):
-    """Perform basic data analysis."""
-    numeric_df = df.select_dtypes(include=['number'])  # Select only numeric columns
-    analysis = {
-        'summary': df.describe(include='all').to_dict(),
-        'missing_values': df.isnull().sum().to_dict(),
-        'correlation': numeric_df.corr().to_dict()  # Compute correlation only on numeric columns
-    }
-    return analysis
+def basic_analysis(data):
+    summary = data.describe(include='all').to_dict()
+    missing_values = data.isnull().sum().to_dict()
+    return {"summary": summary, "missing_values": missing_values}
 
-def visualize_data(df, file_name):
-    """Generate and save visualizations."""
-    sns.set(style="whitegrid")
-    numeric_columns = df.select_dtypes(include=['number']).columns
-    for column in numeric_columns:
-        plt.figure()
-        sns.histplot(df[column].dropna(), kde=True)
-        plt.title(f'Distribution of {column}')
-        plt.savefig(f'{file_name}_{column}_distribution.png')
+def outlier_detection(data):
+    numeric_data = data.select_dtypes(include=np.number)
+    z_scores = np.abs((numeric_data - numeric_data.mean()) / numeric_data.std())
+    outliers = (z_scores > 3).sum().to_dict()
+    return {"outliers": outliers}
+
+def cluster_analysis(data):
+    numeric_data = data.select_dtypes(include=np.number).dropna()
+    if numeric_data.shape[1] >= 2:
+        kmeans = KMeans(n_clusters=3, random_state=42)
+        numeric_data['cluster'] = kmeans.fit_predict(numeric_data)
+        sns.scatterplot(
+            x=numeric_data.iloc[:, 0],
+            y=numeric_data.iloc[:, 1],
+            hue=numeric_data['cluster'],
+            palette='viridis'
+        )
+        plt.title("Cluster Analysis")
+        plt.savefig("clusters.png")
         plt.close()
 
-def generate_narrative(analysis):
-    """Generate narrative using LLM."""
-    headers = {
-        'Authorization': f'Bearer {AIPROXY_TOKEN}',
-        'Content-Type': 'application/json'
-    }
-    prompt = f"Provide a detailed analysis based on the following data summary: {analysis}"
-    data = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": prompt}]
-    }
-    try:
-        response = httpx.post(API_URL, headers=headers, json=data, timeout=30.0)
-        response.raise_for_status()
-        return response.json()['choices'][0]['message']['content']
-    except httpx.HTTPStatusError as e:
-        print(f"HTTP error occurred: {e}")
-    except httpx.RequestError as e:
-        print(f"Request error occurred: {e}")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-    return "Narrative generation failed due to an error."
+def correlation_matrix(data):
+    correlation = data.corr(numeric_only=True)
+    sns.heatmap(correlation, annot=True, cmap='coolwarm')
+    plt.title("Correlation Matrix")
+    plt.savefig("correlation_matrix.png")
+    plt.close()
 
-def process_file(file_path):
-    """Process a single CSV file."""
-    df = load_data(file_path)
-    analysis = analyze_data(df)
-    visualize_data(df, os.path.splitext(os.path.basename(file_path))[0])  # Save with the base filename
-    narrative = generate_narrative(analysis)
-    report_filename = f'{os.path.splitext(os.path.basename(file_path))[0]}_README.md'
-    with open(report_filename, 'w') as f:
-        f.write(narrative)
+def query_llm(prompt):
+    headers = {"Authorization": f"Bearer {AIPROXY_TOKEN}"}
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1000,
+        "temperature": 0.7
+    }
+    retries = 3
+    for attempt in range(retries):
+        try:
+            response = httpx.post(API_URL, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"].strip()
+        except httpx.RequestError as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            time.sleep(2)
+    print("Failed after multiple retries.")
+    sys.exit(1)
+
+def generate_story(data, analysis, charts):
+    prompt = (
+        "You are a creative storyteller. "
+        "Craft a compelling narrative based on this dataset analysis:\n\n"
+        f"Data Summary: {analysis['summary']}\n\n"
+        f"Missing Values: {analysis['missing_values']}\n\n"
+        f"Outlier Analysis: {analysis.get('outliers', 'No outliers detected')}\n\n"
+        "The dataset contains information about 10,000 books. "
+        "Create a narrative covering these points:\n"
+        "- Describe the dataset as if introducing it to an audience.\n"
+        "- Highlight interesting insights or anomalies discovered.\n"
+        "- Use a conversational tone, as if explaining findings to a curious reader.\n"
+        "- Reference these charts for visual support: correlation_matrix.png, clusters.png.\n"
+        "End the story with a thought-provoking conclusion about the dataset and its implications."
+    )
+    return query_llm(prompt)
+
+def save_readme(content):
+    with open("README.md", "w") as f:
+        f.write(content)
+
+def visualize_data(data):
+    correlation_matrix(data)
+    cluster_analysis(data)
 
 def main():
-    # List of CSV files to process
-    csv_files = ["goodreads.csv", "happiness.csv", "media.csv"]
-    
-    # Process each file
-    for csv_file in csv_files:
-        print(f"Processing {csv_file}...")
-        if os.path.exists(csv_file):
-            process_file(csv_file)
-            print(f"Finished processing {csv_file}. Results saved.")
-        else:
-            print(f"File {csv_file} not found. Skipping.")
+    if len(sys.argv) != 2:
+        print("Usage: uv run autolysis.py <dataset.csv>")
+        sys.exit(1)
+
+    file_path = sys.argv[1]
+    data = load_data(file_path)
+
+    analysis = basic_analysis(data)
+    outliers = outlier_detection(data)
+    combined_analysis = {**analysis, **outliers}
+
+    visualize_data(data)
+
+    story = generate_story(data, combined_analysis, ["correlation_matrix.png", "clusters.png"])
+    save_readme(story)
 
 if __name__ == "__main__":
     main()
